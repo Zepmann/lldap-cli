@@ -1,0 +1,1233 @@
+#!/usr/bin/env bash
+
+# LLDAP CLI interface
+
+# Sensible defaults
+lldapConfig="/etc/lldap.toml"
+username="admin"
+httpUrl="http://localhost:17170"
+httpAuthEndpoint="/auth/simple/login"
+httpGraphQlEndpoint="/api/graphql"
+httpLogoutEndpoint="/auth/logout"
+httpRefreshEndpoint="/auth/refresh"
+
+# These hard-coded text-based attributes need special care as of LLDAP v0.5.1-alpha
+specialReadUserAttributes=(creation_date display_name mail user_id uuid)
+specialReadUserAttributeNames=(creationDate displayName email id uuid)
+specialWriteUserAttributes=(display_name mail)
+specialWriteUserAttributeNames=(displayName email)
+
+specialReadGroupAttributes=(creation_date display_name group_id uuid)
+specialReadGroupAttributeNames=(creationDate displayName id uuid)
+specialWriteGroupAttributes=(display_name)
+specialWriteGroupAttributeNames=(displayName)
+
+getConfigValue() {
+  parameter=$1
+
+  if echo "$parameter" | grep -q "-"; then
+    section=$(echo "$parameter" | cut -d '-' -f 1)
+    option=$(echo "$parameter" | cit -d '-' -f 2)
+  else
+    section=general
+    option="$parameter"
+  fi
+
+  currentSection=general
+  currentOption=
+  value=
+  while read line; do
+    if echo "$line" | grep -qE '^[[:space:]]*\['; then
+      # A section
+      currentSection=$(echo "$line" | sed -E 's/\[([[:alnum:]_]+)\]/\1/')
+    elif echo "$line" | grep -qE '^[[:space:]]*[[:alnum:]]'; then
+      # An option
+      if [ "$currentSection" == "$section" ]; then
+        # A matching section
+        currentOption=$(echo "$line" | sed -E 's/([[:alnum:]_]+)[[:space:]]*=.*/\1/')
+        if [ "$currentOption" == "$option" ]; then
+          # A matching option
+          value=$(echo "$line"  | sed -E 's/^[[:space:]]*[[:alnum:]_]+[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$/\1/')
+          value=$(echo "$value" | tr -d '"' | tr -d "'")
+          break
+        fi
+      fi
+    fi
+  done < <(grep -vE '^($|[[:space:]]*#)' "$lldapConfig")
+
+  [ "$value" ] && echo "$value" || return 1
+}
+
+getToken() {
+  url="${httpUrl}${httpAuthEndpoint}"
+  username="$1"
+  password="$2"
+  if ! response=$(curl -s -X POST -H 'Content-Type: application/json' --data-binary "{\"username\":\"${username}\", \"password\":\"${password}\"}" "$url"); then
+    echo "ERROR: Connection error to lldap web interface: $url" >&2
+    return 1 
+  fi
+  [ "${response:0:1}" != "{" ] && echo "$response" && return 1
+  token=$(echo "$response" | jq -r '.token')
+  refreshToken=$(echo "$response" | jq -r '.refreshToken')
+  echo -e "${token}\n${refreshToken}"
+}
+
+getNewToken() {
+  url="${httpUrl}${httpRefreshEndpoint}"
+  refreshToken="$1"
+  if ! response=$(curl -s -b "refresh_token=${refreshToken}" "$url"); then
+    echo "ERROR: Connection error to lldap web interface: $url" >&2
+    return 1
+  fi
+  [ "${response:0:1}" != "{" ] && echo "$response" && return 1
+  token=$(echo "$response" | jq -r '.token')
+  echo "${token}"
+}
+
+logout() {
+  if [ "$logout" ]; then
+    url="${httpUrl}${httpLogoutEndpoint}"
+    refreshToken="$httpRefreshToken"
+    if ! curl -s -b "refresh_token=${refreshToken}" "$url"; then
+      echo "ERROR: Connection error to lldap web interface: $url" >&2
+      return 1
+    fi
+  fi
+}
+
+runQuery() {
+  url="${httpUrl}${httpGraphQlEndpoint}"
+  token="$httpToken"
+  query="$1"
+  variables="$2"
+  file="$3"
+  variablesClosure="$4"
+
+  if [ -z "$query" ]; then
+    echo "ERROR: Empty GraphQL query" >&2
+    return 1
+  fi
+  [ -z "$variables" ] && variables='""'
+  data="{\"query\":\"${query}\",\"variables\":${variables}"
+
+  if [ ! "$file" ]; then
+    data+="}"
+    if ! response=$(curl "$url" \
+      -s \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer $token" \
+      --data-binary "$data" \
+      -w %{http_code})
+    then
+      echo "ERROR: Connection error to lldap web interface: $url" >&2
+      return 1
+    fi
+  else
+    if [ -z "$variablesClosure" ]; then
+      echo "ERROR: Incomplete GraphQL variable data" >&2
+      return 1
+    fi
+    if [ ! -e "$file" ]; then
+      echo "ERROR: File does not exist: $file" >&2
+      return 1
+    fi
+    dataClosure="${variablesClosure}}"
+    dataFile="/tmp/$(basename $file).curlpostdata"
+    echo -n "$data" > "$dataFile"
+    base64 -w0 $file >> "$dataFile"
+    echo -n "$dataClosure" >> "$dataFile"
+    if ! response=$(curl "$url" \
+      -s \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer $token" \
+      --data-binary "@${dataFile}" \
+      -w %{http_code})
+    then
+      echo "ERROR: Connection error to lldap web interface: $url" >&2
+      rm "$dataFile"
+      return 1
+    fi
+    rm "$dataFile"
+  fi
+
+  responseCode="${response:(-3)}"
+  response="${response::-3}"
+
+  error="$(echo "$response" | jq '.errors[].message' 2>/dev/null | tr -d '"')"
+  if [ "$error" ]; then
+    echo "ERROR: $error" >&2
+    return 1
+  fi
+  case $responseCode in
+    200) echo "$response"; ;;
+    401) echo "ERROR: $response" >&2; echo "       Most likely the offered (refresh) token is not valid anymore. Try logging in again." >&2 && return 1 ;;
+    *) echo "Unknown response code from GraphQL API: $responseCode" >&2; echo "Response: $response" >&2; return 1 ;;
+  esac
+}
+
+getUsersData() {
+  query='{users{id creationDate uuid email displayName firstName lastName}}'
+  variables=""
+
+  runQuery "$query" "$variables"
+}
+listUsers() {
+  getUsersData | jq -r '(["User ID (user_id)", "Email (mail)", "Display Name (display_name)"] | (., map(length*"-"))), (.data.users[] | [.id, .email, .displayName]) | @tsv' | column -ts $'\t'
+}
+listUsersId() {
+  getUsersData | jq '.data.users[].id' | tr -d '"'
+}
+listUsersEmail() {
+  getUsersData | jq '.data.users[].email' | tr -d '"' | sort
+}
+getUserIdByUserEmail() {
+  email="$1"
+
+  query='{users{id email}}'
+  variables=""
+
+  runQuery "$query" "$variables" | jq -r '(.data.users[] | [.id, .email]) | @csv' | grep -E ",\"${email}\"$" | cut -d ',' -f 1 | tr -d '"'
+}
+listGroupsByUserId() {
+  id="$1"
+
+  query='query listGroupsByUserId($id:String!){user(userId:$id){groups{displayName}}}'
+  variables="{\"id\":\"${id}\"}"
+
+  runQuery "$query" "$variables" | jq '.data.user.groups[].displayName' | tr -d '"'
+}
+listUserAttributes() {
+  id="$1"
+
+  query='query getUserInfo($id:String!){user(userId:$id){attributes{name}}}'
+  variables="{\"id\":\"${id}\"}"
+
+  list=
+  for attribute in "${specialReadUserAttributes[@]}"; do
+    list+="${attribute}"$'\n'
+  done
+  list="$(echo "$list" | head -n-1)"
+
+  if result="$(runQuery "$query" "$variables")"; then
+    list+="$(echo "$result" | jq '.data.user.attributes[].name' | tr -d '"')"
+    list="$(echo "$list" | sort)"
+    echo "$list"
+  fi
+}
+listUserAttributeValues() {
+  id="$1"
+  attribute="$2"
+
+  specialAttribute=
+  for i in ${!specialReadUserAttributes[@]}; do
+    [ "$attribute" == "${specialReadUserAttributes[$i]}" ] && specialAttribute="${specialReadUserAttributeNames[$i]}"
+  done
+
+  if [ "$specialAttribute" ]; then
+    query="{users{id,$specialAttribute}}"
+    runQuery "$query" | jq ".data.users[] | select(.id==\"$id\") | .${specialAttribute}" | cut -d '"' -f 2
+  else
+    query='query getUserInfo($id:String!){user(userId:$id){attributes{name,value}}}'
+    variables="{\"id\":\"${id}\"}"
+    runQuery "$query" "$variables" | jq ".data.user.attributes[] | select(.name==\"$attribute\") | .value" | head -n-1 | tail -n+2 | cut -d '"' -f 2
+  fi
+}
+createUser() {
+  id="$1"
+  email="$2"
+  name="$3"
+  firstName="$4"
+  lastName="$5"
+  avatar="$6"
+
+  query='mutation createUser($user:CreateUserInput!){createUser(user:$user){id email displayName firstName lastName avatar}}'
+  variables="{\"user\":{\"id\":\"${id}\",\"email\":\"${email}\",\"displayName\":\"${name}\",\"firstName\":\"${firstName}\",\"lastName\":\"${lastName}\",\"avatar\":\""
+
+  if [ "$avatar" ]; then
+    file="$avatar"
+    variablesClosure="\"}}"
+  else
+    variables+="\"}}"
+  fi
+
+  if runQuery "$query" "$variables" "$file" "$variablesClosure" >/dev/null; then
+    echo "Created user: $id"
+  else
+    return 1
+  fi
+}
+updateUser() {
+  mutation="$1"
+  id="$2"
+  attribute="$3"
+  value="$4"
+  file=""
+
+  attributeType="$(schemaGetUserAttributeType "$attribute")"
+  schemaUserAttributeIsList "$attribute" && attributeIsList=true || attributeIsList=
+
+  for i in "${!specialWriteUserAttributes[@]}"; do
+    [ "$attribute" == "${specialWriteUserAttributes[i]}" ] && attributeName="${specialWriteUserAttributeNames[i]}"
+  done
+  [ "$attribute" == "avatar" ] && attributeName="avatar"
+
+  if [ "$attributeName" ]; then
+    if [ "$mutation" != "set" -a "$mutation" != "clear" ]; then
+      echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation." >&2
+      return 1
+    fi
+
+    query='mutation updateUser($user:UpdateUserInput!){updateUser(user:$user){ok}}'
+    variables="{\"user\":{\"id\":\"${id}\",\"${attributeName}\":\""
+
+    if [ "$mutation" == "set" ]; then
+      specialAttribute=
+      for a in "${specialWriteUserAttributes[@]}"; do
+        [ "$attribute" == "$a" ] && specialAttribute=true
+      done
+      if [ "$specialAttribute" ]; then
+        variables+="${value}\"}}"
+      else
+        if [ "$value" ]; then
+          file="$value"
+          variablesClosure="\"}}"
+        else
+          variables+="\"}}"
+        fi
+      fi
+    elif [ "$mutation" == "clear" ]; then
+      variables+="\"}}"
+    fi
+  else
+    case "$mutation" in
+      set) if [ "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
+      add|del) if [ ! "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
+    esac
+
+    query='mutation updateUser($user:UpdateUserInput!){updateUser(user:$user){ok}}'
+    case "$mutation" in
+      set)
+        variables="{\"user\":{\"id\":\"${id}\",\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":\""
+        if [ "$attributeType" != "JPEG_PHOTO" ]; then
+          variables+="${value}\"}}}"
+        else
+          if "$value" ]; then
+            file="value"
+            variablesClosure="\"}}}"
+          else
+            variables+="\"}}}"
+          fi
+        fi
+      ;;
+      clear)
+        valuesText="$(listUserAttributeValues "$id" "$attribute")"
+        if [ -z "$valuesText" ]; then
+          echo "ERROR: Attribute $attribute has no value set for user $id, so nothing to clear." >&2
+          return 1
+        fi
+        variables="{\"user\":{\"id\":\"${id}\",\"removeAttributes\":\"${attribute}\"}}"
+      ;;
+      add)
+        local values
+        toArray values "$(listUserAttributeValues "$id" "$attribute")"
+        values+=("$value")
+        valueList="$(toList "${values[@]}")"
+        variables="{\"user\":{\"id\":\"${id}\",\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
+      ;;
+      del)
+        valuesText="$(listUserAttributeValues "$id" "$attribute")"
+        if ! echo "$valuesText" | grep -qE "^${value}$"; then
+          echo "ERROR: Attribute $attribute has no listed value $value for user $id, so no value to delete." >&2
+          return 1
+        fi
+        valuesText="$(echo "$valuesText" | grep -vE "$value")"
+        if [ -z "$valuesText" ]; then
+          updateUser clear "$id" "$attribute"
+          return $?
+        fi
+        local values
+        toArray values "$valuesText"
+        valueList="$(toList "${values[@]}")"
+        variables="{\"user\":{\"id\":\"${id}\",\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
+      ;;
+    esac
+  fi
+
+  case $mutation in
+    set)   resultLine="Attribute set for user: $id, attribute: $attribute" ;;
+    clear) resultLine="Attribute cleared for user: $id, attribute: $attribute" ;;
+    add)   resultLine="Attribute list value added for user: $id, attribute: $attribute" ;;
+    del)   resultLine="Attribute list value deleted for user: $id, attribute: $attribute, value: $value" ;;
+  esac
+  if [ "$mutation" == "set" -o "$mutation" == "add" ]; then
+    [ "$value" -a "$attributeType" != "JPEG_PHOTO" ] && resultLine+=", value: $value"
+    [ "$value" -a "$attributeType" == "JPEG_PHOTO" ] && resultLine+=", data from: $file"
+  fi
+
+  if runQuery "$query" "$variables" "$file" "$variablesClosure" >/dev/null; then
+    echo "$resultLine"
+  else
+    return 1
+  fi
+}
+deleteUser() {
+  userId="$1"
+
+  query='mutation deleteUser($userId:String!){deleteUser(userId:$userId){ok}}'
+  variables="{\"userId\":\"${userId}\"}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.deleteUser.ok" 2>/dev/null)" == "true" ] && echo "Deleted user: $userId"
+}
+
+getGroupsData() {
+  query='{groups{id creationDate uuid displayName}}'
+  variables=""
+  
+  runQuery "$query" "$variables"
+}
+listGroups() {
+  getGroupsData | jq -r '(["Group ID", "Creation date", "UUID", "Display Name"] | (., map(length*"-"))), (.data.groups[] | [.id,  .creationDate, .uuid, .displayName]) | @tsv' | column -ts $'\t'
+}
+getGroupId() {
+  name="$1"
+
+  id="$(getGroupsData | jq -r '(.data.groups[] | [.id, .displayName]) | @csv' | grep -E ",\"${name}\"$" | cut -d ',' -f 1 | tr -d '"')"
+  [ "$id" ] && echo "$id" || (echo "ERROR: Failed to retrieve group ID for group: $name" >&2; return 1)
+}
+listUserIdsByGroupName() {
+  name="$1"
+  id="$(getGroupId "$name")"
+
+  query='query listUsersByGroupName($id:Int!){group:group(groupId:$id){users{id}}}'
+  variables="{\"id\":${id}}"
+
+  runQuery "$query" "$variables" | jq '.data.group.users[].id' | tr -d '"'
+}
+listUserEmailsByGroupName() {
+  name="$1"
+  id="$(getGroupId "$name")"
+
+  query='query listUsersByGroupName($id:Int!){group:group(groupId:$id){users{email}}}'
+  variables="{\"id\":${id}}"
+
+  runQuery "$query" "$variables" | jq '.data.group.users[].email' | tr -d '"'
+}
+listGroupAttributes() {
+  id="$1"
+
+  query='query getGroupInfo($id:Int!){group(groupId:$id){attributes{name}}}'
+  variables="{\"id\":${id}}"
+
+  list=
+  for attribute in "${specialReadGroupAttributes[@]}"; do
+    list+="${attribute}"$'\n'
+  done
+  list="$(echo "$list" | head -n-1)"
+
+  if list+="$(runQuery "$query" "$variables" | jq '.data.group.attributes[].name' | tr -d '"')"; then
+    list="$(echo "$list" | sort)"
+    echo "$list"
+  fi
+}
+listGroupAttributeValues() {
+  id="$1"
+  attribute="$2"
+
+  specialAttribute=
+  for i in ${!specialReadGroupAttributes[@]}; do
+    [ "$attribute" == "${specialReadGroupAttributes[$i]}" ] && specialAttribute="${specialReadGroupAttributeNames[$i]}"
+  done
+
+  if [ "$specialAttribute" ]; then
+    query="{groups{id,$specialAttribute}}"
+    runQuery "$query" | jq ".data.groups[] | select(.id==$id) | .${specialAttribute}" | cut -d '"' -f 2
+  else
+    query='query getGroupInfo($id:Int!){group(groupId:$id){attributes{name,value}}}'
+    variables="{\"id\":${id}}"
+    runQuery "$query" "$variables" | jq ".data.group.attributes[] | select(.name==\"$attribute\") | .value" | head -n-1 | tail -n+2 | cut -d '"' -f 2
+  fi
+}
+createGroup() {
+  name="$1"
+
+  query='mutation createGroup($group:String!){createGroup(name:$group){id}}'
+  variables="{\"group\":\"${name}\"}"
+
+  if runQuery "$query" "$variables" >/dev/null; then
+    echo "Created group: $name"
+  else
+    return 1
+  fi
+}
+updateGroup() {
+  mutation="$1"
+  name="$2"
+  attribute="$3"
+  value="$4"
+  file=""
+
+  if ! id="$(getGroupId "$name")"; then
+    return 1
+  fi
+  attributeType="$(schemaGetGroupAttributeType "$attribute")"
+  schemaGroupAttributeIsList "$attribute" && attributeIsList=true || attributeIsList=
+
+  for i in "${!specialWriteGroupAttributes[@]}"; do
+    [ "$attribute" == "${specialWriteGroupAttributes[i]}" ] && attributeName="${specialWriteGroupAttributeNames[i]}"
+  done
+
+  if [ "$attributeName" ]; then
+    if [ "$mutation" != "set" -a "$mutation" != "clear" ]; then
+      echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation." >&2
+      return 1
+    fi
+
+    query='mutation updateGroup($group:UpdateGroupInput!){updateGroup(group:$group){ok}}'
+    variables="{\"group\":{\"id\":${id},\"${attributeName}\":\""
+
+    if [ "$mutation" == "set" ]; then
+      specialAttribute=
+      for a in "${specialWriteGroupAttributes[@]}"; do
+        [ "$attribute" == "$a" ] && specialAttribute=true
+      done
+      if [ "$specialAttribute" ]; then
+        variables+="${value}\"}}"
+      else
+        if [ "$value" ]; then
+          file="$value"
+          variablesClosure="\"}}"
+        else
+          variables+="\"}}"
+        fi
+      fi
+    elif [ "$mutation" == "clear" ]; then
+      variables+="\"}}"
+    fi
+  else
+    case "$mutation" in
+      set) if [ "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
+      add|del) if [ ! "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
+    esac
+
+    query='mutation updateGroup($group:UpdateGroupInput!){updateGroup(group:$group){ok}}'
+    case "$mutation" in
+      set)
+        variables="{\"group\":{\"id\":${id},\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":\""
+        if [ "$attributeType" != "JPEG_PHOTO" ]; then
+          variables+="${value}\"}}}"
+        else
+          if "$value" ]; then
+            file="value"
+            variablesClosure="\"}}}"
+          else
+            variables+="\"}}}"
+          fi
+        fi
+      ;;
+      clear)
+        valuesText="$(listGroupAttributeValues "$id" "$attribute")"
+        if [ -z "$valuesText" ]; then
+          echo "ERROR: Attribute $attribute has no value set for group $name, so nothing to clear." >&2
+          return 1
+        fi
+        variables="{\"group\":{\"id\":${id},\"removeAttributes\":\"${attribute}\"}}"
+      ;;
+      add)
+        local values
+        toArray values "$(listGroupAttributeValues "$id" "$attribute")"
+        values+=("$value")
+        valueList="$(toList "${values[@]}")"
+        variables="{\"group\":{\"id\":${id},\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
+      ;;
+      del)
+        valuesText="$(listGroupAttributeValues "$id" "$attribute")"
+        if ! echo "$valuesText" | grep -qE "^${value}$"; then
+          echo "ERROR: Attribute $attribute has no listed value $value for group $name, so no value to delete." >&2
+          return 1
+        fi
+        valuesText="$(echo "$valuesText" | grep -vE "$value")"
+        if [ -z "$valuesText" ]; then
+          updateGroup clear "$name" "$attribute"
+          return $?
+        fi
+        local values
+        toArray values "$valuesText"
+        valueList="$(toList "${values[@]}")"
+        variables="{\"group\":{\"id\":${id},\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
+      ;;
+    esac
+  fi
+
+  case $mutation in
+    set)   resultLine="Attribute set for group: $name, attribute: $attribute" ;;
+    clear) resultLine="Attribute cleared for group: $name, attribute: $attribute" ;;
+    add)   resultLine="Attribute list value added for group: $name, attribute: $attribute" ;;
+    del)   resultLine="Attribute list value deleted for group: $name, attribute: $attribute, value: $value" ;;
+  esac
+  if [ "$mutation" == "set" -o "$mutation" == "add" ]; then
+    [ "$value" -a "$attributeType" != "JPEG_PHOTO" ] && resultLine+=", value: $value"
+    [ "$value" -a "$attributeType" == "JPEG_PHOTO" ] && resultLine+=", data from: $file"
+  fi
+
+  if runQuery "$query" "$variables" "$file" "$variablesClosure" >/dev/null; then
+    echo "$resultLine"
+  else
+    return 1
+  fi
+}
+deleteGroup() {
+  name="$1"
+  id="$(getGroupId "$name")"
+
+  query='mutation deleteGroup($id:Int!){deleteGroup(groupId:$id){ok}}'
+  variables="{\"id\":${id}}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.deleteGroup.ok" 2>/dev/null)" == "true" ] && echo "Deleted group: $name" || (echo "ERROR: Failed to delete group: $name" >&2; return 1)
+}
+addUserToGroup() {
+  userId="$1"
+  groupName="$2"
+  groupId="$(getGroupId "$groupName")"
+
+  query='mutation addUserToGroup($userId:String!,$groupId:Int!){addUserToGroup(userId:$userId,groupId:$groupId){ok}}'
+  variables="{\"userId\":\"${userId}\",\"groupId\":${groupId}}"
+
+  runQuery "$query" "$variables"
+}
+removeUserFromGroup() {
+  userId="$1"
+  groupName="$2"
+  groupId="$(getGroupId "$groupName")"
+
+  query='mutation removeUserFromGroup($userId:String!,$groupId:Int!){removeUserFromGroup(userId:$userId,groupId:$groupId){ok}}'
+  variables="{\"userId\":\"${userId}\",\"groupId\":${groupId}}"
+
+  runQuery "$query" "$variables"
+}
+
+schemaGetUserAttributeData() {
+  query='{schema{userSchema{attributes{name,attributeType,isList,isVisible,isEditable}}}}'
+
+  if response="$(runQuery "$query")"; then
+    echo "$response"
+  else
+    return 1
+  fi
+}
+schemaListUserAttributes() {
+  schemaGetUserAttributeData | jq -r '(["Name", "Type", "Is list", "Is visible", "Is editable"] | (., map(length*"-"))), (.data.schema.userSchema.attributes[] | [.name, .attributeType, .isList, .isVisible, .isEditable]) | @tsv' | column -ts $'\t'
+}
+schemaListUserAttributesName() {
+  schemaGetUserAttributeData | jq '.data.schema.userSchema.attributes[].name' | tr -d '"'
+}
+schemaGetUserAttributeType() {
+  name="$1"
+
+  query='{schema{userSchema{attributes{name,attributeType}}}}'
+
+  if output=$(runQuery "$query" | jq -r '(.data.schema.userSchema.attributes[] | [.name, .attributeType]) | @csv' | grep -E "^\"${name}\","); then
+    echo "$output" | cut -d ',' -f 2 | tr -d '"'
+  else
+    echo "ERROR: Attribute $name is not part of user schema." >&2
+    return 1
+  fi
+}
+schemaUserAttributeIsList() {
+  attribute="$1"
+  output=
+
+  output="$(schemaGetUserAttributeData | jq ".data.schema.userSchema.attributes[] | select(.name==\"$attribute\") | .isList")"
+  [ "$output" == "true" ] && return 0
+  [ "$output" == "false" ] && return 1
+  echo "ERROR: Attribute $attribute is not part of user schema." >&2
+  return 255
+}
+schemaAddUserAttribute() {
+  name="$1"
+  type="$2"
+  isList="$3"
+  isVisible="$4"
+  isEditable="$5"
+
+  query='mutation addUserAttribute($name:String!,$type:AttributeType!,$isList:Boolean!,$isVisible:Boolean!,$isEditable:Boolean!){addUserAttribute(name:$name,attributeType:$type,isList:$isList,isVisible:$isVisible,isEditable:$isEditable){ok}}'
+  variables="{\"name\":\"${name}\",\"type\":\"${type}\",\"isList\":${isList},\"isVisible\":${isVisible},\"isEditable\":${isEditable}}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.addUserAttribute.ok" 2>/dev/null)" == "true" ] && echo "Added in schema new user attribute: $name"
+}
+schemaDeleteUserAttribute() {
+  name="$1"
+  query='mutation deleteUserAttribute($name:String!){deleteUserAttribute(name:$name){ok}}'
+  variables="{\"name\":\"${name}\"}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.deleteUserAttribute.ok" 2>/dev/null)" == "true" ] && echo "Deleted from schema user attribute: $name"
+}
+schemaGetGroupAttributeData() {
+  query='{schema{groupSchema{attributes{name,attributeType,isList,isVisible,isEditable}}}}'
+
+  if response="$(runQuery "$query")"; then
+    echo "$response"
+  else
+    return 1
+  fi
+}
+schemaListGroupAttributes() {
+  schemaGetGroupAttributeData "$1" | jq -r '(["Name", "Type", "Is list", "Is visible", "Is editable"] | (., map(length*"-"))), (.data.schema.groupSchema.attributes[] | [.name, .attributeType, .isList, .isVisible, .isEditable]) | @tsv' | column -ts $'\t'
+}
+schemaGetGroupAttributeType() {
+  name="$1"
+
+  query='{schema{groupSchema{attributes{name,attributeType}}}}'
+
+  if output=$(runQuery "$query" | jq -r '(.data.schema.groupSchema.attributes[] | [.name, .attributeType]) | @csv' | grep -E "^\"${name}\","); then
+    echo "$output" | cut -d ',' -f 2 | tr -d '"'
+  else
+    echo "ERROR: Attribute $name is not part of group schema." >&2
+    return 1
+  fi
+}
+schemaGroupAttributeIsList() {
+  attribute="$1"
+  output=
+
+  output="$(schemaGetGroupAttributeData | jq ".data.schema.groupSchema.attributes[] | select(.name==\"$attribute\") | .isList")"
+  [ "$output" == "true" ] && return 0
+  [ "$output" == "false" ] && return 1
+  echo "ERROR: Attribute $attribute is not part of group schema." >&2
+  return 255
+}
+schemaAddGroupAttribute() {
+  name="$1"
+  type="$2"
+  isList="$3"
+  isVisible="$4"
+  isEditable="$5"
+
+  query='mutation addGroupAttribute($name:String!,$type:AttributeType!,$isList:Boolean!,$isVisible:Boolean!,$isEditable:Boolean!){addGroupAttribute(name:$name,attributeType:$type,isList:$isList,isVisible:$isVisible,isEditable:$isEditable){ok}}'
+  variables="{\"name\":\"${name}\",\"type\":\"${type}\",\"isList\":${isList},\"isVisible\":${isVisible},\"isEditable\":${isEditable}}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.addGroupAttribute.ok" 2>/dev/null)" == "true" ] && echo "Defined in schema new group: $name"
+}
+schemaDeleteGroupAttribute() {
+  name="$1"
+  query='mutation deleteGroupAttribute($name:String!){deleteGroupAttribute(name:$name){ok}}'
+  variables="{\"name\":\"${name}\"}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.deleteGroupAttribute.ok" 2>/dev/null)" == "true" ] && echo "Deleted from schema group attribute: $name"
+}
+
+checkPassword() {
+  password="$1"
+
+  if [ "${#password}" -ge 8 ]; then
+    return 0
+  else
+    echo "ERROR: New password is too short, expected at least 8 characters" >&2
+    return 1
+  fi
+}
+
+setUserPassword() {
+  userId="$1"
+  newPassword="$2"
+
+  lldap_set_password -b "$httpUrl" --token="$httpToken" -u "$userId" -p "$newPassword"
+}
+
+isEmail() {
+  echo "$1" | grep -qiE '^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$'
+}
+
+getUid() {
+  if isEmail "$1"; then
+    uid=$(getUserIdByUserEmail "$1")
+    [ -z "$uid" ] && (echo "ERROR: getUid - No user has email address: $1" >&2; return 1)
+    echo "$uid"
+  else
+    echo "$1"
+  fi
+}
+
+toArray() {
+  local -n arr=$1
+  [ -z "$2" ] && return 0
+  while IFS="" read -r p || [[ -n $p ]]; do
+    arr+=("$p")
+  done <<< "$2"
+}
+
+toList() {
+  input=("$@")
+  list="["
+  firstValue=true
+  for value in "${input[@]}"; do
+    [ "$firstValue" ] && firstValue= || list+=","
+    list+="\"$value\""
+  done
+  list+="]"
+  echo "$list"
+}
+
+usage() {
+  name="$(basename $0)"
+   >&2 echo -ne "${name^^}(1)
+
+NAME
+  $name - 'lldap' Administration & Configuration CLI
+
+DESCRIPTION
+  This is the main administration command that can be used for all
+  interactions with LLDAP. It offers the same functionality as the
+  web interface as of LLDAP v0.5.0, and offers additional functionality
+  for working with custom user and group attributes as introduced in
+  LLDAP v0.5.1-alpha.
+
+ENVIRONMENT
+  Environment variables can be used to provide connection information.
+
+  LLDAP_CONFIG       - Location of lldap's configuration file to read
+                       connection information from. E.g.: /etc/lldap.toml
+  LLDAP_HTTPURL      - URL of lldap's web interface.
+                       Default value: http://localhost:17170
+  LLDAP_USERNAME     - Username to authenticate to lldap.
+                       Default value: admin
+  LLDAP_PASSWORD     - Password to authenticate to lldap.
+  LLDAP_TOKEN        - Authentication token for lldap. Replaces username and
+                       password. Has a good synergy with the login and logout
+                       commands.
+  LLDAP_REFRESHTOKEN - Authentication refresh token for lldap. Can be used with
+                       the login command to request a token for subsequent
+                       requests.
+  LLDAP_HTTPENDPOINT_<AUTH|GRAPH|LOGOUT|REFRESH>
+                     - Override a specific default HTTP endpoint. Useful if a
+                       reverse proxy is used that rewrites URLs, for example.
+
+SYNOPSIS
+  $name [ OPTIONS... ] COMMAND SUBCOMMAND [ ARGUMENTS... ]
+
+  This script attempts to read the necessary connection configuration from
+  lldap's configuration file. This might need root permissions, and might
+  fail. The configured location (default or overruled by environment variable
+  is:
+
+    $lldapConfig
+
+  OPTIONS can be used to provide or override connection and login variables.
+
+  [ OPTIONS... ] :=
+    -H <HTTPURL>       - HTTP base URL of the lldap management interface
+    -D <ADMINUSERNAME> - Username of the admin account to login with
+    -w <ADMINPASSWORD> - Password of the admin account to login with
+    -W                 - Prompt user to enter the admin account password
+    -t                 - Token, which replaces username and password
+    -r                 - Refresh token, for use with login and logout commands
+
+COMMAND := { login | logout | user | group } SUBCOMMAND ARGUMENTS
+
+(SUB)COMMANDS
+  COMMAND login :=
+    $name login
+
+    Prints a token and a refresh token. The token can be used to run multiple
+    commands without re-authenticating for each command. The refresh token can
+    be used with the logout command. Can only be used when providing either
+    a username and password combination or a refresh token as login options.
+
+  COMMAND logout :=
+    $name logout
+
+    Invalidates a refresh token and associated token.
+
+  COMMAND user :=
+    $name user list [uid | email] 
+    $name user add <UID> <EMAIL ADDRESS> [-p <PASSWORD>|-P] \\
+      [-d <DISPLAYNAME>] [-f <FIRSTNAME>] [-l <LASTNAME>] [-a <AVATARJPEGFILE>]
+    $name user del <UID | EMAIL ADDRESS>
+    $name user update <MUTATION> <UID | EMAIL ADDRESS> <ATTRIBUTE> [VALUE]
+
+    $name user info [UID | EMAIL ADDRESS]
+    $name user attribute list <UID | EMAIL ADDRESS>
+    $name user attribute values <UID | EMAIL ADDRESS> <ATTRIBUTE>
+
+    $name user group add <UID | EMAIL ADDRESS> <GROUPNAME>
+    $name user group del <UID | EMAIL ADDRESS> <GROUPNAME>
+    $name user group list <UID | EMAIL ADDRESS>
+
+    Arguments for adding a user are mostly self-explanatory.
+    Option -P provides a prompt for the user to enter the new password.
+
+    <MUTATION> := {set | clear | add | del}
+    For updating a user attribute, mutation type set can only be used for
+    attributes that are not lists. Mutation types add and del should be used
+    for lists. Mutation type clear can be used to clear any attribute,
+    including an entire list in a single command.
+    For <ATTRIBUTE>, use an editable attribute name.
+    Use the following command to find attribute names and their properties:
+      $name schema attribute user list
+
+  COMMAND group :=
+    $name group list
+    $name group add <NAME>
+    $name group del <NAME>
+    $name group update <set | clear | add | del> <NAME> <ATTRIBUTE> [VALUE]
+
+    $name group info <NAME>
+    $name group attribute list <NAME>
+    $name group attribute values <NAME> <ATTRIBUTE>
+
+  COMMAND schema :=
+    $name schema attribute <user|group> add <NAME> <TYPE> [ATTRIBUTE OPTIONS]
+    $name schema attribute <user|group> del <NAME>
+    $name schema attribute <user|group> list
+
+    <TYPE> := {string | integer | date_time | jpeg_photo}
+    [ATTRIBUTE OPTIONS] :=
+      -l - Attribute is a list
+      -v - Attribute is visible
+      -e - Attribute is editable
+
+    All attributes included in LLDAP's default schema are hardcoded and
+    cannot be deleted.
+
+EXAMPLES
+  eval \$($name -D admin -w abcd1234 login)
+    Login with username admin and with password abcd1234, and create
+    environment variables for the resulting tokens that will automatically be
+    used in subsequent commands for authentication.
+
+  LLDAP_USERNAME=admin LLDAP_PASSWORD=abcd1234 eval \$($name login)
+    Same as above, but using environment variables as input instead. Note that
+    it is allowed (and recommended, but not shown in these examples) to
+    surround input values in single or double quotes.
+
+  $name user add jsmith john.smith@example.com -d \"John Smith\" -p hunter1
+    Add the user account jsmith with email address john.smith@example.com,
+    display name John Smith, and password hunter1.
+
+  $name user update john.smith@example.com password hunter2
+    Set the account password of the user with email address
+    john.smith@example.com to hunter2.
+
+  $name group add \"mail users\"
+    Create a group named mail users.
+
+  $name user group add jsmith \"mail users\"
+    Add the user account jsmith to the group mail users.
+
+  $name schema attribute user add mailAlias string -l -v
+    Add a new attribute to the user schema with the name mailAlias. This
+    attribute concerns a list, which means that it can occur multiple times
+    in a single LDAP record. It is also visible when queried with LDAP. The
+    attribute can only be modified through LLDAP's GraphQL API (e.g. using
+    LLDAP-CLI) and not LDAP, since it is not marked as editable.
+
+  $name user update add jsmith mailAlias johnnyboy@example.com
+    Adds text value johnnyboy@example.com to the attribute list mailAlias.
+    Note that this value is different from John's (main) mail address, which
+    is still john.smith@example.com.
+"
+}
+
+# Catch a request for help early
+if [ -z "$1" -o "$1" == "help" -o "$1" == "--help" -o "$1" == "-\?" ]; then
+  usage 2>&1
+  exit 0
+fi
+
+# Allow environment variables to set connection options
+[ "$LLDAP_CONFIG" ] && lldapConfig="$LLDAP_CONFIG"
+[ "$LLDAP_HTTPENDPOINT_AUTH" ] && httpAuthEndpoint="$LLDAP_HTTPENDPOINT_AUTH"
+[ "$LLDAP_HTTPENDPOINT_GRAPH" ] && httpGraphQlEndpoint="$LLDAP_HTTPENDPOINT_GRAPH"
+[ "$LLDAP_HTTPENDPOINT_LOGOUT" ] && httpLogoutEndpoint="$LLDAP_HTTPENDPOINT_LOGOUT"
+[ "$LLDAP_HTTPENDPOINT_REFRESH" ] && httpRefreshEndpoint="$LLDAP_HTTPENDPOINT_REFRESH"
+[ "$LLDAP_HTTPURL" ] && httpUrl="$LLDAP_HTTPURL"
+[ "$LLDAP_USERNAME" ] && username="$LLDAP_USERNAME"
+password="$LLDAP_PASSWORD"
+httpToken="$LLDAP_TOKEN"
+httpRefreshToken="$LLDAP_REFRESHTOKEN"
+
+# Allow command line arguments to set/override connection options
+numArgs=0
+while getopts 'H:D:w:Wt:r:' opt; do
+  case "$opt" in
+    H) httpUrl="$OPTARG" ;;
+    D) username="$OPTARG" ;;
+    w) password="$OPTARG" ;;
+    W) echo -n "Login password: " >&2; read -s password ;;
+    t) httpToken="$OPTARG" ;;
+    r) httpRefreshToken="$OPTARG" ;;
+  esac
+done
+shift $((OPTIND-1))
+
+# Attempt to read lldap's configuration file if connection options are missing
+connectionInfo=""
+[ "$httpUrl" -a "$httpToken" ] && connectionInfo=true
+[ "$httpUrl" -a "$username" -a "$password" ] && connectionInfo=true
+[ "$httpUrl" -a "$httpRefreshToken" -a "$1" == "login" ] && connectionInfo=true
+[ "$httpUrl" -a "$httpRefreshToken" -a "$1" == "logout" ] && connectionInfo=true
+if [ -z "$connectionInfo" -a ! -r "$lldapConfig" ]; then
+  echo "ERROR: Missing connection information and $lldapConfig is not available/unreadable." >&2
+  echo "       Try: $(basename $0) help" >&2
+  exit 1
+fi
+if [ -z "$httpUrl" ]; then
+  httpHost="$(getConfigValue general-http_host)"
+  httpPort="$(getConfigValue general-http_port)"
+  if [ -z "$httpHost" -o -z "$httpPort" ]; then
+    echo "ERROR: Missing connection information. Try: $(basename $0) help" >&2
+    exit 1
+  fi
+  httpUrl="http://${httpHost}:${httpPort}"
+fi
+
+# Attempt to login if required
+if [ -z "$httpToken" ]; then
+  if [ -z "$httpRefreshToken" ]; then
+    if [ "$1" != "logout" ]; then
+      [ "$username" ] || username="$(getConfigValue ldap_user_dn)"
+      [ "$password" ] || password="$(getConfigValue ldap_user_pass)"
+      if [ -z "$httpUrl" -o -z "$username" -o -z "$password" ]; then
+        echo "ERROR: Missing connection information. Try: $(basename $0) help" >&2
+        exit 1
+      fi
+      i=0
+      if ! loginData=$(getToken "$username" "$password"); then
+        echo "ERROR: $loginData" >&2
+        exit 1
+      fi
+      while IFS= read -r line; do
+        i=$(($i+1))
+        [ "$i" == 1 ] && httpToken=$line
+        [ "$i" == 2 ] && httpRefreshToken=$line
+      done <<< "$loginData"
+    else
+      echo "ERROR: Cannot logout without a refresh token. Try: $(basename $0) help" >&2
+      exit 1
+    fi
+  elif [ "$1" == "login" ]; then
+    if ! httpToken=$(getNewToken "$httpRefreshToken"); then
+      echo "ERROR: $httpToken" >&2
+      exit 1
+    fi
+  fi
+  [ "$1" != "login" ] && logout="true" || logout=""
+else
+  logout=""
+fi
+
+case "$1" in
+  login)
+    if [ "$httpRefreshToken" ]; then
+      echo "export LLDAP_TOKEN=${httpToken}"
+      echo "export LLDAP_REFRESHTOKEN=${httpRefreshToken}"
+    else
+      echo "ERROR: The login command can only be used when a username or password are" >&2
+      echo "       provided, of if a refresh token is provided." >&2
+      exit 1
+    fi
+  ;;
+  logout)
+    if [ "$httpRefreshToken" ]; then
+      if logout=true logout; then
+        echo "Refresh token and any associated tokens are invalidated." >&2
+      else
+        exit 1
+      fi
+    else
+      echo "ERROR: A refresh token is not available for logout." >&2
+      exit 1
+    fi
+  ;;
+  user)
+    shift 1
+    case "$1" in
+      list)
+        listField="$2"
+        [ -z "$listField" ] && listField=uid
+        case "$listField" in
+          uid) listUsersId ;;
+          email) listUsersEmail ;;
+          *) logout; usage; exit 1 ;;
+        esac
+      ;;
+      add)
+        uid="$2"
+        email="$3"
+        password= displayname= firstname= lastname=
+        shift 3
+        while getopts 'p:Pd:f:l:a:' opt; do
+          case "$opt" in
+            p) userPassword="$OPTARG" ;;
+            P) echo -n "New user password: " >&2; read -s userPassword ;;
+            d) displayName="$OPTARG" ;;
+            f) firstName="$OPTARG" ;;
+            l) lastName="$OPTARG" ;;
+            a) avatar="$OPTARG" ;;
+            *) logout; usage; exit 1 ;;
+          esac
+        done
+        if [ "$userPassword" ]; then
+          if checkPassword "$userPassword"; then
+            createUser "$uid" "$email" "$displayName" "$firstName" "$lastName" "$avatar"
+            setUserPassword "$uid" "$userPassword"
+          fi
+        else
+          createUser "$uid" "$email" "$displayName" "$firstName" "$lastName" "$avatar"
+        fi
+      ;;
+      del)
+        uid="$(getUid $2)"
+        deleteUser "$uid"
+      ;;
+      update)
+        mutation=
+        for m in set clear add del; do [ "$2" == "$m" ] && mutation="$2"; done
+        if [ -z "$mutation" -o -z "$3" -o -z "$4" ]; then logout; usage; exit 1; fi
+        if [ "$mutation" == "del" -a -z "$5" ]; then echo "ERROR: Mutation $mutation needs a value to remove from a list." >&2; exit 1; fi
+        uid="$(getUid $3)"
+        attribute="$4"
+        if [ "$attribute" != "password" ]; then
+          updateUser "$mutation" "$uid" "$attribute" "$5"
+        else
+          if [ "$mutation" != "set" ]; then
+            logout
+            echo "ERROR: Mutation $mutation not supported for attribute password. Use set instead." >&2
+            exit 1
+          fi
+          if [ "$5" ]; then
+            userPassword="$4"
+          else
+            echo -n "New user password: "
+            read -s userPassword
+          fi
+          setUserPassword "$uid" "$userPassword"
+        fi
+      ;;
+      info)
+        filter=
+        if [ "$2" ]; then
+          uid="$(getUid $2)"
+          line=$(listUsers | grep -E "^$uid ")
+          if [ "$(echo "$line" | wc -l)" == "0" ]; then
+            echo "ERROR: Could not find user: $uid" >&2
+            exit 1
+          fi
+          filter="|head -n2; echo \"$line\""
+        fi
+        eval "listUsers $filter"
+      ;;
+      attribute)
+        shift 1
+        uid="$(getUid $2)"
+        case "$1" in
+          list) listUserAttributes "$uid" ;;
+          values)
+            if [ -z "$3" ]; then logout; usage; exit 1; fi
+            listUserAttributeValues "$uid" "$3"
+          ;;
+          *) logout; usage; exit 1 ;;
+        esac
+      ;;
+      group)
+        shift 1
+        uid="$(getUid $2)"
+        case "$1" in
+          add) addUserToGroup "$uid" "$3" ;;
+          del) removeUserFromGroup "$uid" "$3" ;;
+          list) listGroupsByUserId "$uid" ;;
+          *) logout; usage; exit 1 ;;
+        esac
+      ;;
+      *) logout; usage; exit 1 ;;
+    esac
+  ;;
+  group)
+    shift 1
+    case "$1" in
+      add) createGroup "$2" ;;
+      update)
+        mutation=
+        for m in set clear add del; do [ "$2" == "$m" ] && mutation="$2"; done
+        if [ -z "$mutation" -o -z "$3" -o -z "$4" ]; then logout; usage; exit 1; fi
+        gid="$3"
+        attribute="$4"
+        updateGroup "$mutation" "$gid" "$attribute" "$5"
+      ;;
+      del) deleteGroup "$2" ;;
+      info) listUserIdsByGroupName "$2" ;;
+      list) listGroups ;;
+      attribute)
+        shift 1
+        if [ -z "$2" ]; then logout; usage; exit 1; fi
+        if ! gid="$(getGroupId "$2")"; then logout; exit 1; fi
+        case "$1" in
+          list) listGroupAttributes "$gid" ;;
+          values)
+            if [ -z "$3" ]; then logout; usage; exit 1; fi
+            listGroupAttributeValues "$gid" "$3"
+          ;;
+          *) logout; usage; exit 1 ;;
+        esac
+      ;;
+      *) logout; usage; exit 1 ;;
+    esac
+  ;;
+  schema)
+    shift 1
+    case "$1" in
+      attribute)
+        shift 1
+        case "$1" in
+          user)
+            shift 1
+            case "$1" in
+              add)
+                if [ -z "$2" -o -z "$3" ]; then logout; usage; exit 1; fi
+                attribute="$2"
+                attributeType="$3"
+                shift 3
+                attributeIsList=false
+                attributeIsVisible=false
+                attributeIsEditable=false
+                while getopts 'lve' opt; do
+                  case "$opt" in
+                    l) attributeIsList=true ;;
+                    v) attributeIsVisible=true ;;
+                    e) attributeIsEditable=true ;;
+                    *) logout; usage; exit 1 ;;
+                  esac
+                done
+                schemaAddUserAttribute "$attribute" "${attributeType^^}" "$attributeIsList" "$attributeIsVisible" "$attributeIsEditable"
+              ;;
+              del)
+                if [ -z "$2" ]; then logout; usage; exit 1; fi
+                schemaDeleteUserAttribute "$2"
+              ;;
+              list) schemaListUserAttributes ;;
+              *) logout; usage; exit 1 ;;
+            esac
+          ;;
+          group)
+            shift 1
+            case "$1" in
+              add) schemaAddGroupAttribute "$2" "${3^^}" "${4,,}" "${5,,}" "${6,,}" ;;
+              del) schemaDeleteGroupAttribute "$2" ;;
+              list) schemaListGroupAttributes ;;
+              *) logout; usage; exit 1 ;;
+            esac
+          ;;
+          *) logout; usage; exit 1 ;;
+        esac
+      ;;
+      *) logout; usage; exit 1 ;;
+    esac
+  ;;
+  *) logout; usage; exit 1 ;;
+esac
+logout
