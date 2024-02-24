@@ -1,13 +1,13 @@
 # About
 LLDAP-CLI is a command line interface for [LLDAP](https://github.com/lldap/lldap).
 
-LLDAP uses [GraphQL](https://en.wikipedia.org/wiki/GraphQL) to offer an HTTP-based API. This API is by an included web-based user interface. Unfortunately, [LLDAP lacks a command-line interface](https://github.com/lldap/lldap/issues/707), which is a necessity for any serious administrator. LLDAP-CLI translates CLI commands to GraphQL API calls.
+LLDAP uses [GraphQL](https://en.wikipedia.org/wiki/GraphQL) to offer an HTTP-based API. This API is used by an included web-based user interface. Unfortunately, [LLDAP lacks a command-line interface](https://github.com/lldap/lldap/issues/707), which is a necessity for any serious administrator. LLDAP-CLI translates CLI commands to GraphQL API calls.
 
 # Features
 - All functionality of LLDAP's web interface is supported by LLDAP-CLI.
   - User management. List, create and delete users and get and set their attributes. Also manage group membership. Users can be referred to based on usernames or email addresses (which are both unique in LLDAP).
   - Group management. List, create and delete groups and get and update their attributes.
-- LDAP schema management. Create, delete and use custom user and group attributes. This is currently not feature complete yet in LLDAP (and not supported by its user interface), but can be tested using LLDAP-CLI. In the future, this will be usable to store additional data in LLDAP, such as email aliases.
+  - LDAP schema management. Create, delete and use custom user and group attributes and object classes. Use the latest development version of LLDAP to fully support this feature.
 - Different authentication options: environment variables, command line options, and retrieving credentials from LLDAP's configuration file. LLDAP-CLI can use a username and password to authenticate, or JSON web tokens.
 - Different session options. LLDAP-CLI can use a username and password to get JSON web tokens. These tokens can be used for a single command, after which LLDAP-CLI will logout the session immediately (default behavior). Alternatively, the tokens can be re-used for multiple commands, reducing the system load and time needed for bulk operations.
 - Portable. LLDAP-CLI is written in Bash. Aside from LLDAP, its dependencies should be available on most systems either directly or as installable packages from official repositories.
@@ -15,7 +15,7 @@ LLDAP uses [GraphQL](https://en.wikipedia.org/wiki/GraphQL) to offer an HTTP-bas
 # Requirements
 - [LLDAP](https://github.com/lldap/lldap). This tool will be a bit useless if LLDAP is not available. Furthermore, `lldap_set_password` is neccessary to set user passwords.
 - [GNU Bash](https://www.gnu.org/software/bash/). Some features specific to Bash are used, such as arrays and parameter expansion. Other shells might be compatible, but have not been tested.
-- [GNU core utilities](https://www.gnu.org/software/coreutils/). This concerns tools such as cut, head, tail and tr for basic text processing, and base64 for encoding JPEG pictures for upload. These tools might be replaced with alternatives as long as 
+- [GNU core utilities](https://www.gnu.org/software/coreutils/). This concerns tools such as cut, head, tail and tr for basic text processing, and base64 for encoding JPEG pictures for upload.
 - [GNU Grep](https://www.gnu.org/software/grep/). Used for its text matching capabilities.
 - [GNU sed](https://www.gnu.org/software/sed/). Used to get information from LLDAP's configuration file if no authentication options are provided.
 - [jq](https://jqlang.github.io/jq/). Used to process responses from LLDAP's GraphQL API.
@@ -134,14 +134,19 @@ COMMAND := { login | logout | user | group } SUBCOMMAND ARGUMENTS
     lldap-cli schema attribute <user|group> del <NAME>
     lldap-cli schema attribute <user|group> list
 
+    lldap-cli schema objectclass <user|group> add <NAME>
+    lldap-cli schema objectclass <user|group> del <NAME>
+    lldap-cli schema objectclass <user|group> list
+
     <TYPE> := {string | integer | date_time | jpeg_photo}
     [ATTRIBUTE OPTIONS] :=
       -l - Attribute is a list
       -v - Attribute is visible
       -e - Attribute is editable
 
-    All attributes included in LLDAP's default schema are hardcoded and
-    cannot be deleted.
+    All attributes and object classes included in LLDAP's default schema are
+    hardcoded and cannot be deleted. Hardcoded attributes are listed. Hardcoded
+    object classes are not listed.
 
 EXAMPLES
   eval $(lldap-cli -D admin -w abcd1234 login)
