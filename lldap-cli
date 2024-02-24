@@ -383,7 +383,7 @@ deleteUser() {
 getGroupsData() {
   query='{groups{id creationDate uuid displayName}}'
   variables=""
-  
+
   runQuery "$query" "$variables"
 }
 listGroups() {
@@ -721,6 +721,57 @@ schemaDeleteGroupAttribute() {
   [ "$(echo "$response" | jq ".data.deleteGroupAttribute.ok" 2>/dev/null)" == "true" ] && echo "Deleted from schema group attribute: $name"
 }
 
+schemaListUserObjectClasses() {
+  query='{schema{userSchema{extraLdapObjectClasses}}}'
+
+  if response="$(runQuery "$query")"; then
+    echo "$response" | jq ".data.schema.userSchema.extraLdapObjectClasses[]" | cut -d '"' -f 2
+  else
+    return 1
+  fi
+}
+schemaAddUserObjectClass() {
+  name="$1"
+  query='mutation addUserObjectClass($name:String!){addUserObjectClass(name:$name){ok}}'
+  variables="{\"name\":\"${name}\"}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.addUserObjectClass.ok" 2>/dev/null)" == "true" ] && echo "Defined in schema new LDAP extra user object class: $name"
+}
+schemaDeleteUserObjectClass() {
+  name="$1"
+  query='mutation deleteUserObjectClass($name:String!){deleteUserObjectClass(name:$name){ok}}'
+  variables="{\"name\":\"${name}\"}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.deleteUserObjectClass.ok" 2>/dev/null)" == "true" ] && echo "Deleted from schema LDAP extra user object class: $name"
+}
+schemaListGroupObjectClasses() {
+  query='{schema{groupSchema{extraLdapObjectClasses}}}'
+
+  if response="$(runQuery "$query")"; then
+    echo "$response" | jq ".data.schema.groupSchema.extraLdapObjectClasses[]" | cut -d '"' -f 2
+  else
+    return 1
+  fi
+}
+schemaAddGroupObjectClass() {
+  name="$1"
+  query='mutation addGroupObjectClass($name:String!){addGroupObjectClass(name:$name){ok}}'
+  variables="{\"name\":\"${name}\"}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.addGroupObjectClass.ok" 2>/dev/null)" == "true" ] && echo "Defined in schema new LDAP extra group object class: $name"
+}
+schemaDeleteGroupObjectClass() {
+  name="$1"
+  query='mutation deleteGroupObjectClass($name:String!){deleteGroupObjectClass(name:$name){ok}}'
+  variables="{\"name\":\"${name}\"}"
+
+  response="$(runQuery "$query" "$variables")"
+  [ "$(echo "$response" | jq ".data.deleteGroupObjectClass.ok" 2>/dev/null)" == "true" ] && echo "Deleted from schema LDAP extra group object class: $name"
+}
+
 checkPassword() {
   password="$1"
 
@@ -885,14 +936,19 @@ COMMAND := { login | logout | user | group } SUBCOMMAND ARGUMENTS
     $name schema attribute <user|group> del <NAME>
     $name schema attribute <user|group> list
 
+    $name schema objectclass <user|group> add <NAME>
+    $name schema objectclass <user|group> del <NAME>
+    $name schema objectclass <user|group> list
+
     <TYPE> := {string | integer | date_time | jpeg_photo}
     [ATTRIBUTE OPTIONS] :=
       -l - Attribute is a list
       -v - Attribute is visible
       -e - Attribute is editable
 
-    All attributes included in LLDAP's default schema are hardcoded and
-    cannot be deleted.
+    All attributes and object classes included in LLDAP's default schema are
+    hardcoded and cannot be deleted. Hardcoded attributes are listed. Hardcoded
+    object classes are not listed.
 
 EXAMPLES
   eval \$($name -D admin -w abcd1234 login)
@@ -958,7 +1014,7 @@ while getopts 'H:D:w:Wt:r:' opt; do
     H) httpUrl="$OPTARG" ;;
     D) username="$OPTARG" ;;
     w) password="$OPTARG" ;;
-    W) echo -n "Login password: " >&2; read -s password ;;
+    W) echo -n "Login password: " >&2; read -s password; echo "" ;;
     t) httpToken="$OPTARG" ;;
     r) httpRefreshToken="$OPTARG" ;;
   esac
@@ -1219,6 +1275,42 @@ case "$1" in
               add) schemaAddGroupAttribute "$2" "${3^^}" "${4,,}" "${5,,}" "${6,,}" ;;
               del) schemaDeleteGroupAttribute "$2" ;;
               list) schemaListGroupAttributes ;;
+              *) logout; usage; exit 1 ;;
+            esac
+          ;;
+          *) logout; usage; exit 1 ;;
+        esac
+      ;;
+      objectclass)
+        shift 1
+        case "$1" in
+          user)
+            shift 1
+            case "$1" in
+              add)
+                if [ -z "$2" ]; then logout; usage; exit 1; fi
+                schemaAddUserObjectClass "$2"
+              ;;
+              del)
+                if [ -z "$2" ]; then logout; usage; exit 1; fi
+                schemaDeleteUserObjectClass "$2"
+              ;;
+              list) schemaListUserObjectClasses ;;
+              *) logout; usage; exit 1 ;;
+            esac
+          ;;
+          group)
+            shift 1
+            case "$1" in
+              add)
+                if [ -z "$2" ]; then logout; usage; exit 1; fi
+                schemaAddGroupObjectClass "$2"
+              ;;
+              del)
+                if [ -z "$2" ]; then logout; usage; exit 1; fi
+                schemaDeleteGroupObjectClass "$2"
+              ;;
+              list) schemaListGroupObjectClasses ;;
               *) logout; usage; exit 1 ;;
             esac
           ;;
