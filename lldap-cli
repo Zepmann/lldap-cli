@@ -965,7 +965,7 @@ EXAMPLES
     Add the user account jsmith with email address john.smith@example.com,
     display name John Smith, and password hunter1.
 
-  $name user update john.smith@example.com password hunter2
+  $name user update set john.smith@example.com password hunter2
     Set the account password of the user with email address
     john.smith@example.com to hunter2.
 
@@ -1157,7 +1157,7 @@ case "$1" in
             exit 1
           fi
           if [ "$5" ]; then
-            userPassword="$4"
+            userPassword="$5"
           else
             echo -n "New user password: "
             read -s userPassword
