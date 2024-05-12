@@ -209,7 +209,7 @@ listUserAttributes() {
   list="$(echo "$list" | head -n-1)"
 
   if result="$(runQuery "$query" "$variables")"; then
-    list+="$(echo "$result" | jq '.data.user.attributes[].name' | tr -d '"')"
+    list+=$'\n'"$(echo "$result" | jq '.data.user.attributes[].name' | tr -d '"')"
     list="$(echo "$list" | sort)"
     echo "$list"
   fi
