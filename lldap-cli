@@ -1117,6 +1117,8 @@ case "$1" in
         email="$3"
         password= displayname= firstname= lastname=
         shift 3
+        # Reset getopts so we can parse the next args
+        unset OPTIND
         while getopts 'p:Pd:f:l:a:' opt; do
           case "$opt" in
             p) userPassword="$OPTARG" ;;
@@ -1251,6 +1253,8 @@ case "$1" in
                 attributeIsList=false
                 attributeIsVisible=false
                 attributeIsEditable=false
+                # Reset getopts so we can parse the next args
+                unset OPTIND
                 while getopts 'lve' opt; do
                   case "$opt" in
                     l) attributeIsList=true ;;
