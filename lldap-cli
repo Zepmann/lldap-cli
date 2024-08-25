@@ -206,10 +206,10 @@ listUserAttributes() {
   for attribute in "${specialReadUserAttributes[@]}"; do
     list+="${attribute}"$'\n'
   done
-  list="$(echo "$list" | head -n-1)"
 
   if result="$(runQuery "$query" "$variables")"; then
-    list+="$(echo "$result" | jq '.data.user.attributes[].name' | tr -d '"')"
+    list+="$(echo "$result" | jq '.data.user.attributes[].name' | tr -d '"')"$'\n'
+    list="$(echo "$list" | head -n-1)"
     list="$(echo "$list" | sort)"
     echo "$list"
   fi
@@ -423,9 +423,10 @@ listGroupAttributes() {
   for attribute in "${specialReadGroupAttributes[@]}"; do
     list+="${attribute}"$'\n'
   done
-  list="$(echo "$list" | head -n-1)"
 
-  if list+="$(runQuery "$query" "$variables" | jq '.data.group.attributes[].name' | tr -d '"')"; then
+  if result="$(runQuery "$query" "$variables")"; then
+    list+="$(echo "$result" | jq '.data.group.attributes[].name' | tr -d '"')"$'\n'
+    list="$(echo "$list" | head -n-1)"
     list="$(echo "$list" | sort)"
     echo "$list"
   fi
@@ -710,7 +711,7 @@ schemaAddGroupAttribute() {
   variables="{\"name\":\"${name}\",\"type\":\"${type}\",\"isList\":${isList},\"isVisible\":${isVisible},\"isEditable\":${isEditable}}"
 
   response="$(runQuery "$query" "$variables")"
-  [ "$(echo "$response" | jq ".data.addGroupAttribute.ok" 2>/dev/null)" == "true" ] && echo "Defined in schema new group: $name"
+  [ "$(echo "$response" | jq ".data.addGroupAttribute.ok" 2>/dev/null)" == "true" ] && echo "Added in schema new group attribute: $name"
 }
 schemaDeleteGroupAttribute() {
   name="$1"
@@ -1054,7 +1055,7 @@ if [ -z "$httpToken" ]; then
       fi
       i=0
       if ! loginData=$(getToken "$username" "$password"); then
-        echo "ERROR: $loginData" >&2
+        [ "$loginData" ] && echo "ERROR: $loginData" >&2
         exit 1
       fi
       while IFS= read -r line; do
@@ -1272,8 +1273,28 @@ case "$1" in
           group)
             shift 1
             case "$1" in
-              add) schemaAddGroupAttribute "$2" "${3^^}" "${4,,}" "${5,,}" "${6,,}" ;;
-              del) schemaDeleteGroupAttribute "$2" ;;
+              add)
+                if [ -z "$2" -o -z "$3" ]; then logout; usage; exit 1; fi
+                attribute="$2"
+                attributeType="$3"
+                shift 3
+                attributeIsList=false
+                attributeIsVisible=false
+                attributeIsEditable=false
+                while getopts 'lve' opt; do
+                  case "$opt" in
+                    l) attributeIsList=true ;;
+                    v) attributeIsVisible=true ;;
+                    e) attributeIsEditable=true ;;
+                    *) logout; usage; exit 1 ;;
+                  esac
+                done
+                schemaAddGroupAttribute "$attribute" "${attributeType^^}" "$attributeIsList" "$attributeIsVisible" "$attributeIsEditable"
+              ;;
+              del)
+                if [ -z "$2" ]; then logout; usage; exit 1; fi
+                schemaDeleteGroupAttribute "$2"
+              ;;
               list) schemaListGroupAttributes ;;
               *) logout; usage; exit 1 ;;
             esac
@@ -1322,4 +1343,7 @@ case "$1" in
   ;;
   *) logout; usage; exit 1 ;;
 esac
+
+functionExitCode=$?
 logout
+[ $(($functionExitCode+$?)) -eq 0 ]
