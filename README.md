@@ -163,7 +163,7 @@ EXAMPLES
     Add the user account jsmith with email address john.smith@example.com,
     display name John Smith, and password hunter1.
 
-  lldap-cli user update john.smith@example.com password hunter2
+  lldap-cli user update set john.smith@example.com password hunter2
     Set the account password of the user with email address
     john.smith@example.com to hunter2.
 
