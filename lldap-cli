@@ -1118,6 +1118,7 @@ case "$1" in
         email="$3"
         password= displayname= firstname= lastname=
         shift 3
+        OPTIND=1
         while getopts 'p:Pd:f:l:a:' opt; do
           case "$opt" in
             p) userPassword="$OPTARG" ;;
@@ -1249,6 +1250,7 @@ case "$1" in
                 attribute="$2"
                 attributeType="$3"
                 shift 3
+                OPTIND=1
                 attributeIsList=false
                 attributeIsVisible=false
                 attributeIsEditable=false
