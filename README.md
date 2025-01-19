@@ -1,13 +1,15 @@
 # About
 LLDAP-CLI is a command line interface for [LLDAP](https://github.com/lldap/lldap).
 
-LLDAP uses [GraphQL](https://en.wikipedia.org/wiki/GraphQL) to offer an HTTP-based API. This API is used by an included web-based user interface. Unfortunately, [LLDAP lacks a command-line interface](https://github.com/lldap/lldap/issues/707), which is a necessity for any serious administrator. LLDAP-CLI translates CLI commands to GraphQL API calls.
+LLDAP uses [GraphQL](https://en.wikipedia.org/wiki/GraphQL) to offer an HTTP-based API. This API is used by the included web interface. Unfortunately, [LLDAP lacks a command-line interface](https://github.com/lldap/lldap/issues/707), which is a necessity for any serious administrator.
+
+LLDAP-CLI translates CLI commands to GraphQL API calls. Its primary goal is to offer the same functionality the web interface, but through a CLI instead. A secondary goal is to support new additional features available through the GraphQL API but which are not supported by the web interface. Check out LLDAP's [GraphQL schema](https://github.com/lldap/lldap/blob/main/schema.graphql) to see available functions. The main developer of LLDAP-CLI might add new functions or not, depending on whether development time is available.
 
 # Features
 - All functionality of LLDAP's web interface is supported by LLDAP-CLI.
   - User management. List, create and delete users and get and set their attributes. Also manage group membership. Users can be referred to based on usernames or email addresses (which are both unique in LLDAP).
   - Group management. List, create and delete groups and get and update their attributes.
-  - LDAP schema management. Create, delete and use custom user and group attributes and object classes. Use the latest development version of LLDAP to fully support this feature.
+  - LDAP schema management. Create, delete and use custom user and group attributes and object classes.
 - Different authentication options: environment variables, command line options, and retrieving credentials from LLDAP's configuration file. LLDAP-CLI can use a username and password to authenticate, or JSON web tokens.
 - Different session options. LLDAP-CLI can use a username and password to get JSON web tokens. These tokens can be used for a single command, after which LLDAP-CLI will logout the session immediately (default behavior). Alternatively, the tokens can be re-used for multiple commands, reducing the system load and time needed for bulk operations.
 - Portable. LLDAP-CLI is written in Bash. Aside from LLDAP, its dependencies should be available on most systems either directly or as installable packages from official repositories.
@@ -19,12 +21,11 @@ LLDAP uses [GraphQL](https://en.wikipedia.org/wiki/GraphQL) to offer an HTTP-bas
 - [GNU Grep](https://www.gnu.org/software/grep/). Used for its text matching capabilities.
 - [GNU sed](https://www.gnu.org/software/sed/). Used to get information from LLDAP's configuration file if no authentication options are provided.
 - [jq](https://jqlang.github.io/jq/). Used to process responses from LLDAP's GraphQL API.
-- [curl](https://curl.se/). Used to communicate with LLDAP over HTTP.
+- [curl](https://curl.se/). Used to communicate with LLDAP over HTTP(S).
 
 # How to use
 Below is a copy of LLDAP-CLI's help information.
-```
-LLDAP-CLI(1)
+```LLDAP-CLI(1)
 
 NAME
   lldap-cli - 'lldap' Administration & Configuration CLI
@@ -32,9 +33,7 @@ NAME
 DESCRIPTION
   This is the main administration command that can be used for all
   interactions with LLDAP. It offers the same functionality as the
-  web interface as of LLDAP v0.5.0, and offers additional functionality
-  for working with custom user and group attributes as introduced in
-  LLDAP v0.5.1-alpha.
+  web interface as of LLDAP v0.6.1. Do not use with older LLDAP versions.
 
 ENVIRONMENT
   Environment variables can be used to provide connection information.
@@ -159,13 +158,13 @@ EXAMPLES
     it is allowed (and recommended, but not shown in these examples) to
     surround input values in single or double quotes.
 
-  lldap-cli user add jsmith john.smith@example.com -d "John Smith" -p hunter1
+  lldap-cli user add jsmith john.smith@example.com -d "John Smith" -p hunter1!
     Add the user account jsmith with email address john.smith@example.com,
-    display name John Smith, and password hunter1.
+    display name John Smith, and password hunter1!.
 
-  lldap-cli user update set john.smith@example.com password hunter2
+  lldap-cli user update set john.smith@example.com password hunter2!
     Set the account password of the user with email address
-    john.smith@example.com to hunter2.
+    john.smith@example.com to hunter2!.
 
   lldap-cli group add "mail users"
     Create a group named mail users.
