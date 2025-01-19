@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 # LLDAP CLI interface
 
 # Sensible defaults
@@ -10,17 +9,6 @@ httpAuthEndpoint="/auth/simple/login"
 httpGraphQlEndpoint="/api/graphql"
 httpLogoutEndpoint="/auth/logout"
 httpRefreshEndpoint="/auth/refresh"
-
-# These hard-coded text-based attributes need special care as of LLDAP v0.5.1-alpha
-specialReadUserAttributes=(creation_date display_name mail user_id uuid)
-specialReadUserAttributeNames=(creationDate displayName email id uuid)
-specialWriteUserAttributes=(display_name mail)
-specialWriteUserAttributeNames=(displayName email)
-
-specialReadGroupAttributes=(creation_date display_name group_id uuid)
-specialReadGroupAttributeNames=(creationDate displayName id uuid)
-specialWriteGroupAttributes=(display_name)
-specialWriteGroupAttributeNames=(displayName)
 
 getConfigValue() {
   parameter=$1
@@ -203,10 +191,6 @@ listUserAttributes() {
   variables="{\"id\":\"${id}\"}"
 
   list=
-  for attribute in "${specialReadUserAttributes[@]}"; do
-    list+="${attribute}"$'\n'
-  done
-
   if result="$(runQuery "$query" "$variables")"; then
     list+="$(echo "$result" | jq '.data.user.attributes[].name' | tr -d '"')"$'\n'
     list="$(echo "$list" | head -n-1)"
@@ -218,19 +202,9 @@ listUserAttributeValues() {
   id="$1"
   attribute="$2"
 
-  specialAttribute=
-  for i in ${!specialReadUserAttributes[@]}; do
-    [ "$attribute" == "${specialReadUserAttributes[$i]}" ] && specialAttribute="${specialReadUserAttributeNames[$i]}"
-  done
-
-  if [ "$specialAttribute" ]; then
-    query="{users{id,$specialAttribute}}"
-    runQuery "$query" | jq ".data.users[] | select(.id==\"$id\") | .${specialAttribute}" | cut -d '"' -f 2
-  else
-    query='query getUserInfo($id:String!){user(userId:$id){attributes{name,value}}}'
-    variables="{\"id\":\"${id}\"}"
-    runQuery "$query" "$variables" | jq ".data.user.attributes[] | select(.name==\"$attribute\") | .value" | head -n-1 | tail -n+2 | cut -d '"' -f 2
-  fi
+  query='query getUserInfo($id:String!){user(userId:$id){attributes{name,value}}}'
+  variables="{\"id\":\"${id}\"}"
+  runQuery "$query" "$variables" | jq ".data.user.attributes[] | select(.name==\"$attribute\") | .value" | head -n-1 | tail -n+2 | cut -d '"' -f 2
 }
 createUser() {
   id="$1"
@@ -266,99 +240,63 @@ updateUser() {
   attributeType="$(schemaGetUserAttributeType "$attribute")"
   schemaUserAttributeIsList "$attribute" && attributeIsList=true || attributeIsList=
 
-  for i in "${!specialWriteUserAttributes[@]}"; do
-    [ "$attribute" == "${specialWriteUserAttributes[i]}" ] && attributeName="${specialWriteUserAttributeNames[i]}"
-  done
-  [ "$attribute" == "avatar" ] && attributeName="avatar"
+  case "$mutation" in
+    set) if [ "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
+    add|del) if [ ! "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
+  esac
 
-  if [ "$attributeName" ]; then
-    if [ "$mutation" != "set" -a "$mutation" != "clear" ]; then
-      echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation." >&2
-      return 1
-    fi
-
-    query='mutation updateUser($user:UpdateUserInput!){updateUser(user:$user){ok}}'
-    variables="{\"user\":{\"id\":\"${id}\",\"${attributeName}\":\""
-
-    if [ "$mutation" == "set" ]; then
-      specialAttribute=
-      for a in "${specialWriteUserAttributes[@]}"; do
-        [ "$attribute" == "$a" ] && specialAttribute=true
-      done
-      if [ "$specialAttribute" ]; then
-        variables+="${value}\"}}"
+  query='mutation updateUser($user:UpdateUserInput!){updateUser(user:$user){ok}}'
+  case "$mutation" in
+    set)
+      variables="{\"user\":{\"id\":\"${id}\",\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":\""
+      if [ "$attributeType" != "JPEG_PHOTO" ]; then
+        variables+="${value}\"}}}"
       else
         if [ "$value" ]; then
           file="$value"
-          variablesClosure="\"}}"
+          variablesClosure="\"}}}"
         else
-          variables+="\"}}"
+          variables+="\"}}}"
         fi
       fi
-    elif [ "$mutation" == "clear" ]; then
-      variables+="\"}}"
-    fi
-  else
-    case "$mutation" in
-      set) if [ "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
-      add|del) if [ ! "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
-    esac
-
-    query='mutation updateUser($user:UpdateUserInput!){updateUser(user:$user){ok}}'
-    case "$mutation" in
-      set)
-        variables="{\"user\":{\"id\":\"${id}\",\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":\""
-        if [ "$attributeType" != "JPEG_PHOTO" ]; then
-          variables+="${value}\"}}}"
-        else
-          if "$value" ]; then
-            file="value"
-            variablesClosure="\"}}}"
-          else
-            variables+="\"}}}"
-          fi
-        fi
-      ;;
-      clear)
-        valuesText="$(listUserAttributeValues "$id" "$attribute")"
-        if [ -z "$valuesText" ]; then
-          echo "ERROR: Attribute $attribute has no value set for user $id, so nothing to clear." >&2
-          return 1
-        fi
-        variables="{\"user\":{\"id\":\"${id}\",\"removeAttributes\":\"${attribute}\"}}"
-      ;;
-      add)
-        local values
-        toArray values "$(listUserAttributeValues "$id" "$attribute")"
-        values+=("$value")
-        valueList="$(toList "${values[@]}")"
-        variables="{\"user\":{\"id\":\"${id}\",\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
-      ;;
-      del)
-        valuesText="$(listUserAttributeValues "$id" "$attribute")"
-        if ! echo "$valuesText" | grep -qE "^${value}$"; then
-          echo "ERROR: Attribute $attribute has no listed value $value for user $id, so no value to delete." >&2
-          return 1
-        fi
-        valuesText="$(echo "$valuesText" | grep -vE "$value")"
-        if [ -z "$valuesText" ]; then
-          updateUser clear "$id" "$attribute"
-          return $?
-        fi
-        local values
-        toArray values "$valuesText"
-        valueList="$(toList "${values[@]}")"
-        variables="{\"user\":{\"id\":\"${id}\",\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
-      ;;
-    esac
-  fi
-
-  case $mutation in
-    set)   resultLine="Attribute set for user: $id, attribute: $attribute" ;;
-    clear) resultLine="Attribute cleared for user: $id, attribute: $attribute" ;;
-    add)   resultLine="Attribute list value added for user: $id, attribute: $attribute" ;;
-    del)   resultLine="Attribute list value deleted for user: $id, attribute: $attribute, value: $value" ;;
+      resultLine="Attribute set for user: $id, attribute: $attribute"
+    ;;
+    clear)
+      valuesText="$(listUserAttributeValues "$id" "$attribute")"
+      if [ -z "$valuesText" ]; then
+        echo "ERROR: Attribute $attribute has no value set for user $id, so nothing to clear." >&2
+        return 1
+      fi
+      variables="{\"user\":{\"id\":\"${id}\",\"removeAttributes\":\"${attribute}\"}}"
+      resultLine="Attribute cleared for user: $id, attribute: $attribute"
+    ;;
+    add)
+      local values
+      toArray values "$(listUserAttributeValues "$id" "$attribute")"
+      values+=("$value")
+      valueList="$(toList "${values[@]}")"
+      variables="{\"user\":{\"id\":\"${id}\",\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
+      resultLine="Attribute list value added for user: $id, attribute: $attribute"
+    ;;
+    del)
+      valuesText="$(listUserAttributeValues "$id" "$attribute")"
+      if ! echo "$valuesText" | grep -qE "^${value}$"; then
+        echo "ERROR: Attribute $attribute has no listed value $value for user $id, so no value to delete." >&2
+        return 1
+      fi
+      valuesText="$(echo "$valuesText" | grep -vE "$value")"
+      if [ -z "$valuesText" ]; then
+        updateUser clear "$id" "$attribute"
+        return $?
+      fi
+      local values
+      toArray values "$valuesText"
+      valueList="$(toList "${values[@]}")"
+      variables="{\"user\":{\"id\":\"${id}\",\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
+      resultLine="Attribute list value deleted for user: $id, attribute: $attribute, value: $value"
+    ;;
   esac
+
   if [ "$mutation" == "set" -o "$mutation" == "add" ]; then
     [ "$value" -a "$attributeType" != "JPEG_PHOTO" ] && resultLine+=", value: $value"
     [ "$value" -a "$attributeType" == "JPEG_PHOTO" ] && resultLine+=", data from: $file"
@@ -420,10 +358,6 @@ listGroupAttributes() {
   variables="{\"id\":${id}}"
 
   list=
-  for attribute in "${specialReadGroupAttributes[@]}"; do
-    list+="${attribute}"$'\n'
-  done
-
   if result="$(runQuery "$query" "$variables")"; then
     list+="$(echo "$result" | jq '.data.group.attributes[].name' | tr -d '"')"$'\n'
     list="$(echo "$list" | head -n-1)"
@@ -435,19 +369,9 @@ listGroupAttributeValues() {
   id="$1"
   attribute="$2"
 
-  specialAttribute=
-  for i in ${!specialReadGroupAttributes[@]}; do
-    [ "$attribute" == "${specialReadGroupAttributes[$i]}" ] && specialAttribute="${specialReadGroupAttributeNames[$i]}"
-  done
-
-  if [ "$specialAttribute" ]; then
-    query="{groups{id,$specialAttribute}}"
-    runQuery "$query" | jq ".data.groups[] | select(.id==$id) | .${specialAttribute}" | cut -d '"' -f 2
-  else
-    query='query getGroupInfo($id:Int!){group(groupId:$id){attributes{name,value}}}'
-    variables="{\"id\":${id}}"
-    runQuery "$query" "$variables" | jq ".data.group.attributes[] | select(.name==\"$attribute\") | .value" | head -n-1 | tail -n+2 | cut -d '"' -f 2
-  fi
+  query='query getGroupInfo($id:Int!){group(groupId:$id){attributes{name,value}}}'
+  variables="{\"id\":${id}}"
+  runQuery "$query" "$variables" | jq ".data.group.attributes[] | select(.name==\"$attribute\") | .value" | head -n-1 | tail -n+2 | cut -d '"' -f 2
 }
 createGroup() {
   name="$1"
@@ -474,91 +398,58 @@ updateGroup() {
   attributeType="$(schemaGetGroupAttributeType "$attribute")"
   schemaGroupAttributeIsList "$attribute" && attributeIsList=true || attributeIsList=
 
-  for i in "${!specialWriteGroupAttributes[@]}"; do
-    [ "$attribute" == "${specialWriteGroupAttributes[i]}" ] && attributeName="${specialWriteGroupAttributeNames[i]}"
-  done
+  case "$mutation" in
+    set) if [ "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
+    add|del) if [ ! "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
+  esac
 
-  if [ "$attributeName" ]; then
-    if [ "$mutation" != "set" -a "$mutation" != "clear" ]; then
-      echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation." >&2
-      return 1
-    fi
-
-    query='mutation updateGroup($group:UpdateGroupInput!){updateGroup(group:$group){ok}}'
-    variables="{\"group\":{\"id\":${id},\"${attributeName}\":\""
-
-    if [ "$mutation" == "set" ]; then
-      specialAttribute=
-      for a in "${specialWriteGroupAttributes[@]}"; do
-        [ "$attribute" == "$a" ] && specialAttribute=true
-      done
-      if [ "$specialAttribute" ]; then
-        variables+="${value}\"}}"
+  query='mutation updateGroup($group:UpdateGroupInput!){updateGroup(group:$group){ok}}'
+  case "$mutation" in
+    set)
+      variables="{\"group\":{\"id\":${id},\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":\""
+      if [ "$attributeType" != "JPEG_PHOTO" ]; then
+        variables+="${value}\"}}}"
       else
         if [ "$value" ]; then
           file="$value"
-          variablesClosure="\"}}"
+          variablesClosure="\"}}}"
         else
-          variables+="\"}}"
+          variables+="\"}}}"
         fi
       fi
-    elif [ "$mutation" == "clear" ]; then
-      variables+="\"}}"
-    fi
-  else
-    case "$mutation" in
-      set) if [ "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
-      add|del) if [ ! "$attributeIsList" ]; then echo "ERROR: Attribute $attribute is not a list and cannot be modified using the $mutation mutation."; return 1; fi ;;
-    esac
-
-    query='mutation updateGroup($group:UpdateGroupInput!){updateGroup(group:$group){ok}}'
-    case "$mutation" in
-      set)
-        variables="{\"group\":{\"id\":${id},\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":\""
-        if [ "$attributeType" != "JPEG_PHOTO" ]; then
-          variables+="${value}\"}}}"
-        else
-          if "$value" ]; then
-            file="value"
-            variablesClosure="\"}}}"
-          else
-            variables+="\"}}}"
-          fi
-        fi
-      ;;
-      clear)
-        valuesText="$(listGroupAttributeValues "$id" "$attribute")"
-        if [ -z "$valuesText" ]; then
-          echo "ERROR: Attribute $attribute has no value set for group $name, so nothing to clear." >&2
-          return 1
-        fi
-        variables="{\"group\":{\"id\":${id},\"removeAttributes\":\"${attribute}\"}}"
-      ;;
-      add)
-        local values
-        toArray values "$(listGroupAttributeValues "$id" "$attribute")"
-        values+=("$value")
-        valueList="$(toList "${values[@]}")"
-        variables="{\"group\":{\"id\":${id},\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
-      ;;
-      del)
-        valuesText="$(listGroupAttributeValues "$id" "$attribute")"
-        if ! echo "$valuesText" | grep -qE "^${value}$"; then
-          echo "ERROR: Attribute $attribute has no listed value $value for group $name, so no value to delete." >&2
-          return 1
-        fi
-        valuesText="$(echo "$valuesText" | grep -vE "$value")"
-        if [ -z "$valuesText" ]; then
-          updateGroup clear "$name" "$attribute"
-          return $?
-        fi
-        local values
-        toArray values "$valuesText"
-        valueList="$(toList "${values[@]}")"
-        variables="{\"group\":{\"id\":${id},\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
-      ;;
-    esac
-  fi
+    ;;
+    clear)
+      valuesText="$(listGroupAttributeValues "$id" "$attribute")"
+      if [ -z "$valuesText" ]; then
+        echo "ERROR: Attribute $attribute has no value set for group $name, so nothing to clear." >&2
+        return 1
+      fi
+      variables="{\"group\":{\"id\":${id},\"removeAttributes\":\"${attribute}\"}}"
+    ;;
+    add)
+      local values
+      toArray values "$(listGroupAttributeValues "$id" "$attribute")"
+      values+=("$value")
+      valueList="$(toList "${values[@]}")"
+      variables="{\"group\":{\"id\":${id},\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
+    ;;
+    del)
+      valuesText="$(listGroupAttributeValues "$id" "$attribute")"
+      if ! echo "$valuesText" | grep -qE "^${value}$"; then
+        echo "ERROR: Attribute $attribute has no listed value $value for group $name, so no value to delete." >&2
+        return 1
+      fi
+      valuesText="$(echo "$valuesText" | grep -vE "$value")"
+      if [ -z "$valuesText" ]; then
+        updateGroup clear "$name" "$attribute"
+        return $?
+      fi
+      local values
+      toArray values "$valuesText"
+      valueList="$(toList "${values[@]}")"
+      variables="{\"group\":{\"id\":${id},\"insertAttributes\":{\"name\":\"${attribute}\",\"value\":${valueList}}}}"
+    ;;
+  esac
 
   case $mutation in
     set)   resultLine="Attribute set for group: $name, attribute: $attribute" ;;
@@ -835,9 +726,7 @@ NAME
 DESCRIPTION
   This is the main administration command that can be used for all
   interactions with LLDAP. It offers the same functionality as the
-  web interface as of LLDAP v0.5.0, and offers additional functionality
-  for working with custom user and group attributes as introduced in
-  LLDAP v0.5.1-alpha.
+  web interface as of LLDAP v0.6.1. Do not use with older LLDAP versions.
 
 ENVIRONMENT
   Environment variables can be used to provide connection information.
@@ -962,13 +851,13 @@ EXAMPLES
     it is allowed (and recommended, but not shown in these examples) to
     surround input values in single or double quotes.
 
-  $name user add jsmith john.smith@example.com -d \"John Smith\" -p hunter1
+  $name user add jsmith john.smith@example.com -d \"John Smith\" -p hunter1!
     Add the user account jsmith with email address john.smith@example.com,
-    display name John Smith, and password hunter1.
+    display name John Smith, and password hunter1!.
 
-  $name user update set john.smith@example.com password hunter2
+  $name user update set john.smith@example.com password hunter2!
     Set the account password of the user with email address
-    john.smith@example.com to hunter2.
+    john.smith@example.com to hunter2!.
 
   $name group add \"mail users\"
     Create a group named mail users.
@@ -1015,7 +904,7 @@ while getopts 'H:D:w:Wt:r:' opt; do
     H) httpUrl="$OPTARG" ;;
     D) username="$OPTARG" ;;
     w) password="$OPTARG" ;;
-    W) echo -n "Login password: " >&2; read -s password; echo "" ;;
+    W) echo -n "Login password: " >&2; read -s password; echo "" >&2 ;;
     t) httpToken="$OPTARG" ;;
     r) httpRefreshToken="$OPTARG" ;;
   esac
@@ -1092,6 +981,8 @@ case "$1" in
   logout)
     if [ "$httpRefreshToken" ]; then
       if logout=true logout; then
+        echo "unset LLDAP_TOKEN"
+        echo "unset LLDAP_REFRESHTOKEN"
         echo "Refresh token and any associated tokens are invalidated." >&2
       else
         exit 1
